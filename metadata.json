@@ -1,0 +1,6 @@
+{
+  "name": "Missing People Tracker",
+  "description": "Comprehensive missing people tracking, reporting, verification, and sighting coordination system.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,163 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default safety catch-all: Deny all unhandled operations
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global Hardened Helper Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Role Lookups against trusted database documents (Zero trust in client claims)
+    function isAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function isInvestigator() {
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/investigators/$(request.auth.uid)) ||
+        isAdmin()
+      );
+    }
+
+    // -------------------------------------------------------------
+    // USERS COLLECTION
+    // -------------------------------------------------------------
+    match /users/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin() || isInvestigator());
+      allow list: if isAdmin();
+      
+      // User can create their own profile, but cannot self-assign privileged roles
+      allow create: if isSignedIn() && request.auth.uid == userId &&
+        incoming().role in ['reporter', 'public'] &&
+        incoming().uid == request.auth.uid &&
+        incoming().email is string && incoming().email.size() <= 120 &&
+        incoming().displayName is string && incoming().displayName.size() <= 80;
+
+      // User cannot elevate their own role
+      allow update: if isSignedIn() && (
+        (request.auth.uid == userId && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'phoneNumber']) && incoming().role == existing().role) ||
+        isAdmin()
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // -------------------------------------------------------------
+    // MISSING PERSONS & REPORTS COLLECTION
+    // -------------------------------------------------------------
+    match /missingPersons/{caseId} {
+      // Public can read only verified, published cases
+      allow get: if (resource.data.visibility == 'public' && resource.data.status != 'Pending Review') ||
+        (isSignedIn() && (resource.data.ownerId == request.auth.uid || isInvestigator() || isAdmin()));
+
+      allow list: if (resource.data.visibility == 'public' && resource.data.status != 'Pending Review') ||
+        (isSignedIn() && (resource.data.ownerId == request.auth.uid || isInvestigator() || isAdmin()));
+
+      // Create new case: starts in 'Pending Review' and 'private' visibility
+      allow create: if isSignedIn() && isValidId(caseId) &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().status == 'Pending Review' &&
+        incoming().visibility in ['private', 'investigators_only'] &&
+        incoming().fullName is string && incoming().fullName.size() >= 2 && incoming().fullName.size() <= 120 &&
+        incoming().age is number && incoming().age >= 0 && incoming().age <= 120 &&
+        incoming().lastSeenCity is string && incoming().lastSeenCity.size() <= 80 &&
+        incoming().circumstances is string && incoming().circumstances.size() >= 15 && incoming().circumstances.size() <= 4000;
+
+      // Update case: Split into action gates
+      allow update: if isSignedIn() && isValidId(caseId) && (
+        // Admin: Full override for approvals, rejections, assignments
+        isAdmin() ||
+        // Assigned Investigator: Can update case status and add internal investigation links
+        (isInvestigator() && (
+          (existing().assignedInvestigatorId == request.auth.uid || isAdmin()) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'priority', 'additionalInfoRequested', 'updatedAt'])
+        )) ||
+        // Reporter Owner: Can update physical descriptors while pending, or withdraw
+        (existing().ownerId == request.auth.uid && (
+          (incoming().diff(existing()).affectedKeys().hasOnly(['status']) && incoming().status == 'Withdrawn') ||
+          (existing().status == 'Pending Review' && incoming().diff(existing()).affectedKeys().hasOnly(['clothingLastSeen', 'identifyingFeatures', 'updatedAt']))
+        ))
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // -------------------------------------------------------------
+    // SIGHTINGS COLLECTION
+    // -------------------------------------------------------------
+    match /sightings/{sightingId} {
+      // Public visitors can only view approved, verified sightings with stripped witness data
+      allow get: if (resource.data.status == 'Verified Relevant') ||
+        (isSignedIn() && (isInvestigator() || isAdmin()));
+
+      allow list: if (resource.data.status == 'Verified Relevant') ||
+        (isSignedIn() && (isInvestigator() || isAdmin()));
+
+      // Any citizen can submit a sighting; starts as 'New'
+      allow create: if isValidId(sightingId) &&
+        incoming().status == 'New' &&
+        incoming().caseId is string &&
+        incoming().dateObserved is string &&
+        incoming().city is string && incoming().city.size() <= 80 &&
+        incoming().observationDetails is string && incoming().observationDetails.size() >= 10 && incoming().observationDetails.size() <= 3000;
+
+      // Only investigators & admins can review and update status of leads
+      allow update: if (isInvestigator() || isAdmin()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['status', 'investigatorNotes', 'reviewedBy', 'reviewedAt']);
+
+      allow delete: if isAdmin();
+    }
+
+    // -------------------------------------------------------------
+    // CONFIDENTIAL INVESTIGATION NOTES
+    // -------------------------------------------------------------
+    match /investigationNotes/{noteId} {
+      // Strictly confidential: Only certified investigators and admins
+      allow read, write: if (isInvestigator() || isAdmin());
+    }
+
+    // -------------------------------------------------------------
+    // NOTIFICATIONS
+    // -------------------------------------------------------------
+    match /notifications/{notifId} {
+      allow read: if isSignedIn() && (
+        resource.data.recipientId == request.auth.uid ||
+        (resource.data.recipientId == 'all-admins' && isAdmin()) ||
+        (resource.data.recipientId == 'all-investigators' && isInvestigator())
+      );
+      allow update: if isSignedIn() && incoming().diff(existing()).affectedKeys().hasOnly(['isRead']);
+      allow create: if isSignedIn();
+      allow delete: if isAdmin();
+    }
+
+    // -------------------------------------------------------------
+    // AUDIT LOGS (IMMUTABLE LEDGER)
+    // -------------------------------------------------------------
+    match /auditLogs/{logId} {
+      allow read: if isInvestigator() || isAdmin();
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow update, delete: if false; // Immutable: no modifications or deletions permitted
+    }
+  }
+}

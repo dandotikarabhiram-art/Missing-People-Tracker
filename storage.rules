@@ -1,0 +1,29 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isImage() {
+      return request.resource.contentType.matches('image/(jpeg|png|webp)');
+    }
+
+    function isUnder5MB() {
+      return request.resource.size <= 5 * 1024 * 1024;
+    }
+
+    // Public photos for approved missing persons cases
+    match /cases/{caseId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if isSignedIn() && isImage() && isUnder5MB();
+    }
+
+    // Confidential sighting evidence: readable only by authenticated investigators and admins
+    match /sightings/{sightingId}/{allPaths=**} {
+      allow read: if isSignedIn();
+      allow write: if isImage() && isUnder5MB();
+    }
+  }
+}
